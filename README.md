@@ -30,7 +30,7 @@ Grab the latest **macOS DMG** from the [Releases](../../releases/latest) page, o
 
 ```bash
 brew install python@3.13 python-tk@3.13
-pip install requests beautifulsoup4 html2text certifi markdown weasyprint
+pip install -r requirements.txt
 ```
 
 ### Launch
