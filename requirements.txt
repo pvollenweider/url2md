@@ -1,0 +1,6 @@
+requests>=2.33
+beautifulsoup4>=4.14
+html2text>=2025.4
+certifi>=2026.2
+markdown>=3.10
+weasyprint>=68
