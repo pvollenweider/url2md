@@ -4,3 +4,5 @@ html2text>=2025.4
 certifi>=2026.2
 markdown>=3.10
 weasyprint>=68
+customtkinter>=5.2
+pillow>=11.0

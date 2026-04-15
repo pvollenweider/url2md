@@ -22,9 +22,9 @@ Convert any web page to clean Markdown — with a native macOS GUI.
 - **Full-text content filter** — search cached page content with BM25 ranking and weighted headings (H1 › H2 › H3 › body); pages score `●●●` / `●●` / `●` by relevance
 - **Filter presets** — save, apply and delete named filter combinations (URL + content)
 - **PDF export** — export the Markdown to a beautifully styled A4 PDF via WeasyPrint
-- **Split preview** — live Markdown preview with scrollbar alongside the raw source
-- **Image toggle** — optionally keep or strip images
-- **Dark UI** — minimal Catppuccin-inspired dark interface built with CustomTkinter
+- **Split preview** — live Markdown preview with syntax-highlighted source alongside a rendered preview; images load asynchronously when "Keep images" is enabled
+- **Image toggle** — optionally keep or strip images; preview renders them inline
+- **Light UI** — clean light interface built with CustomTkinter
 
 ## Download
 
@@ -87,21 +87,30 @@ The Sitemap tab has two independent filters that stack, plus named presets.
 
 ### URL filter
 
-Matched against the page URL. Supports `and`, `or`, `not` and parentheses. Tokens are matched as case-insensitive substrings. Every token must be separated by an explicit operator — there is no implicit `and`.
+Matched against the page URL. Supports `and`, `or`, `not` and parentheses. Tokens are matched as case-insensitive substrings.
 
-| Expression | Matches |
-|---|---|
-| `developer` | all developer docs |
-| `jahia-8.2 and developer` | developer docs for Jahia 8.2 |
-| `forms-3.3 and end-user` | end-user docs for Forms 3.3 |
-| `(jahia-8.2 or jahia-8-2) and developer` | developer docs regardless of URL format |
-| `forms-3.3 and (developer or system-administrator)` | technical docs for Forms 3.3 |
-| `(8.2 or 8-2) and not end-user and not 8-1 and not jexperience` | Jahia 8.2 non-end-user docs |
-| `not release-notes` | everything except release notes |
+**Shorthand syntax** — two shorthands are expanded automatically:
+
+| Shorthand | Expands to | Meaning |
+|---|---|---|
+| `a b` | `a and b` | space = implicit AND |
+| `-foo` | `not foo` | leading minus = NOT |
+
+> A hyphen *inside* a token (`8-2`, `forms-3.3`) is never treated as NOT.
+
+| Expression | Equivalent | Matches |
+|---|---|---|
+| `developer` | — | all developer docs |
+| `jahia-8.2 developer` | `jahia-8.2 and developer` | developer docs for Jahia 8.2 |
+| `forms-3.3 end-user` | `forms-3.3 and end-user` | end-user docs for Forms 3.3 |
+| `(jahia-8.2 or jahia-8-2) developer` | `… and developer` | developer docs regardless of URL format |
+| `forms-3.3 (developer or system-administrator)` | `… and (…)` | technical docs for Forms 3.3 |
+| `8.2 -end-user -8-1 -jexperience` | `8.2 and not end-user and not 8-1 and not jexperience` | Jahia 8.2 non-end-user docs |
+| `-release-notes` | `not release-notes` | everything except release notes |
 
 ### Content filter
 
-Matched against the **cached Markdown text** of each page using BM25 full-text search with weighted columns (H1 = 100 · H2 = 40 · H3 = 15 · body = 1). Pages not yet in cache remain visible but appear dimmed.
+Matched against the **cached Markdown text** of each page using BM25 full-text search with weighted columns (H1 = 100 · H2 = 40 · H3 = 15 · body = 1). URL content (links) is excluded from indexing. Pages not yet in cache remain visible but appear dimmed. Prefix matching is supported (`Graph` matches `GraphQL`).
 
 Results are sorted by relevance and annotated with score badges:
 
@@ -111,17 +120,18 @@ Results are sorted by relevance and annotated with score badges:
 | `●●` | score ≥ 33 % of the best match |
 | `●` | score > 0 |
 
-| Expression | Pages matched (example corpus) |
-|---|---|
-| `GraphQL` | 218 pages mentioning GraphQL |
-| `Elasticsearch` | pages referencing Elasticsearch |
-| `OSGi` | pages involving OSGi bundles or services |
-| `workflow` | pages describing publication workflows |
-| `GraphQL and not deprecated` | GraphQL pages that don't mention deprecation |
-| `OSGi or Maven` | pages mentioning either OSGi or Maven |
-| `validation and (email or recaptcha)` | validation pages focused on email or captcha |
+The same shorthand syntax applies (`-deprecated`, implicit AND):
 
-Combine both filters to narrow precisely — e.g. URL filter `forms-3.3 and developer` + content filter `validation` returns only Forms 3.3 developer pages that actually discuss validation.
+| Expression | Equivalent | Pages matched |
+|---|---|---|
+| `GraphQL` | — | pages mentioning GraphQL |
+| `Graph` | — | same (prefix match) |
+| `GraphQL -deprecated` | `GraphQL and not deprecated` | GraphQL pages without deprecation |
+| `OSGi Maven` | `OSGi and Maven` | pages mentioning both |
+| `OSGi or Maven` | — | pages mentioning either |
+| `validation (email or recaptcha)` | `validation and (…)` | validation pages for email/captcha |
+
+Combine both filters to narrow precisely — e.g. URL filter `forms-3.3 developer` + content filter `validation` returns only Forms 3.3 developer pages that actually discuss validation.
 
 ### Presets
 
@@ -134,6 +144,14 @@ Presets are stored in `~/.cache/url2md/presets.json`.
 Pages are cached at `~/.cache/url2md/pages.db` (SQLite + FTS5). When fetching a sitemap, each page's `lastmod` date is compared to the cache entry's `cached_at` timestamp — pages modified after the last fetch are automatically invalidated. Use the **Clear cache** button in the Sitemap tab to wipe everything.
 
 The cache can also be pre-populated from a **Jahia CMS XML export** without fetching anything from the web (see below).
+
+### Rebuilding the FTS index
+
+If the full-text search index becomes out of sync (e.g. after a partial migration), rebuild it with:
+
+```bash
+/opt/homebrew/bin/python3.13 -c "from url2md import PageCache; c = PageCache(); print(c.rebuild_fts(), 'pages reindexed')"
+```
 
 ## Jahia XML import
 

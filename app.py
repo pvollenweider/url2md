@@ -1,6 +1,7 @@
 #!/opt/homebrew/bin/python3.13
 """url2md — GUI (CustomTkinter)"""
 
+import io
 import json
 import re
 import threading
@@ -10,6 +11,13 @@ from urllib.parse import urldefrag, urlparse
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import customtkinter as ctk
+import certifi
+import requests
+try:
+    from PIL import Image as _PilImage, ImageTk as _ImageTk
+    _PIL_OK = True
+except ImportError:
+    _PIL_OK = False
 
 from url2md import (
     PageCache,
@@ -23,7 +31,7 @@ from jahia_import import import_xml_to_cache
 
 _cache = PageCache()
 
-ctk.set_appearance_mode("dark")
+ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
 
 # ── palette ───────────────────────────────────────────────────────────────────
@@ -214,6 +222,49 @@ def _rewrite_links(md: str, url_to_anchor: dict[str, str]) -> str:
         return f"[{text}](#{anchor})" if anchor else m.group(0)
     return re.sub(r"\[([^\]]+)\]\(([^)]+)\)", replace, md)
 
+def _normalize_filter(expr: str) -> str:
+    """
+    Expand shorthand syntax before compilation:
+      'a b'    → 'a and b'    (implicit AND between terms)
+      '-foo'   → 'not foo'    (leading minus = NOT)
+    Existing operators (and/or/not) and parentheses are preserved as-is.
+    """
+    _OPS = {'and', 'or', 'not'}
+    tokens = re.findall(r'\(|\)|[^\s()]+', expr.strip())
+    result: list[str] = []
+
+    def _last() -> str | None:
+        for t in reversed(result):
+            s = t.strip()
+            if s:
+                return s
+        return None
+
+    for tok in tokens:
+        if tok in ('(', ')'):
+            result.append(tok)
+            continue
+        low = tok.lower()
+        if low in _OPS:
+            result.append(low)
+            continue
+        # leading minus → 'not'
+        if tok.startswith('-') and len(tok) > 1:
+            lm = _last()
+            if lm and lm not in _OPS and lm != '(':
+                result.append('and')
+            result.append('not')
+            result.append(tok[1:])
+            continue
+        # regular term: implicit AND if previous was a term or ')'
+        lm = _last()
+        if lm and lm not in _OPS and lm != '(':
+            result.append('and')
+        result.append(tok)
+
+    return ' '.join(result)
+
+
 def _compile_filter(expr: str):
     """Compile '(8.2 or 8-2) and developer' → callable(url) -> bool."""
     tokens = re.findall(r'\(|\)|[^\s()]+', expr.strip())
@@ -237,6 +288,10 @@ def _compile_filter(expr: str):
         return None
 
 # ── Markdown preview (native tk.Text renderer) ───────────────────────────────
+
+_RE_IMAGE   = re.compile(r'!\[([^\]]*)\]\(([^)]+)\)')
+_IMG_MAX_W  = 560
+_IMG_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 _INLINE = re.compile(
     r'\*\*\*(.+?)\*\*\*'       # bold+italic
@@ -268,6 +323,7 @@ class MarkdownPreview(tk.Text):
             highlightthickness=0,
             **kw,
         )
+        self._images: list = []   # keep PhotoImage refs alive
         F, M = self._F, self._M
         self.tag_configure("h1",  font=(F,22,"bold"), foreground="#11112a", spacing1=14, spacing3=6)
         self.tag_configure("h2",  font=(F,17,"bold"), foreground="#11112a", spacing1=10, spacing3=4)
@@ -292,6 +348,7 @@ class MarkdownPreview(tk.Text):
     # ── public ────────────────────────────────────────────────────────────────
 
     def render(self, md: str) -> None:
+        self._images.clear()
         self.configure(state="normal")
         self.delete("1.0", "end")
         if md:
@@ -386,6 +443,22 @@ class MarkdownPreview(tk.Text):
                 i += 1
                 continue
 
+            # image  ![alt](url)
+            m = _RE_IMAGE.match(s)
+            if m and _PIL_OK:
+                alt, img_url = m.group(1), m.group(2)
+                mark = f"img_{i}_{id(img_url)}"
+                self.insert("end", "\n")
+                self.mark_set(mark, "end-1c")
+                self.mark_gravity(mark, "left")
+                threading.Thread(
+                    target=self._fetch_image,
+                    args=(mark, img_url, alt),
+                    daemon=True,
+                ).start()
+                i += 1
+                continue
+
             # normal paragraph
             self._inline(line + "\n")
             i += 1
@@ -407,6 +480,43 @@ class MarkdownPreview(tk.Text):
             pos = m.end()
         if pos < len(text):
             self.insert("end", text[pos:], tags)
+
+    def _fetch_image(self, mark: str, url: str, alt: str) -> None:
+        """Background thread: fetch image and schedule insertion on main thread."""
+        try:
+            resp = requests.get(url, headers=_IMG_HEADERS, timeout=8,
+                                verify=certifi.where())
+            resp.raise_for_status()
+            img = _PilImage.open(io.BytesIO(resp.content)).convert("RGBA")
+            w, h = img.size
+            if w > _IMG_MAX_W:
+                h = int(h * _IMG_MAX_W / w)
+                w = _IMG_MAX_W
+                img = img.resize((w, h), _PilImage.LANCZOS)
+            photo = _ImageTk.PhotoImage(img)
+            self.after(0, self._insert_image, mark, photo, alt)
+        except Exception:
+            if alt:
+                self.after(0, self._insert_alt, mark, alt)
+
+    def _insert_image(self, mark: str, photo, alt: str) -> None:
+        try:
+            self._images.append(photo)
+            self.configure(state="normal")
+            self.image_create(mark, image=photo, padx=4, pady=4)
+            if alt:
+                self.insert(mark, f"\n{alt}\n", "dim")
+            self.configure(state="disabled")
+        except Exception:
+            pass
+
+    def _insert_alt(self, mark: str, alt: str) -> None:
+        try:
+            self.configure(state="normal")
+            self.insert(mark, f"[{alt}]\n", "dim")
+            self.configure(state="disabled")
+        except Exception:
+            pass
 
     def _table(self, lines: list[str]) -> None:
         rows = []
@@ -432,6 +542,64 @@ class MarkdownPreview(tk.Text):
         self.insert("end", "\n")
 
 
+# ── Markdown source with syntax highlighting ─────────────────────────────────
+
+class MarkdownSource(tk.Text):
+    """Read-only tk.Text showing raw Markdown with lightweight syntax colours."""
+
+    _PATTERNS: list[tuple[str, re.Pattern]] = [
+        ("fence",   re.compile(r'^```.*?^```[ \t]*$', re.MULTILINE | re.DOTALL)),
+        ("comment", re.compile(r'<!--.*?-->', re.DOTALL)),
+        ("heading", re.compile(r'^#{1,6} .*', re.MULTILINE)),
+        ("hr",      re.compile(r'^[-*_]{3,}\s*$', re.MULTILINE)),
+        ("bold",    re.compile(r'\*\*[^*\n]+\*\*|__[^_\n]+__')),
+        ("italic",  re.compile(r'(?<!\*)\*(?!\*)[^*\n]+(?<!\*)\*(?!\*)'
+                               r'|(?<!_)_(?!_)[^_\n]+(?<!_)_(?!_)')),
+        ("link",    re.compile(r'\[([^\]]+)\]\([^)]*\)')),
+        ("code",    re.compile(r'`[^`\n]+`')),
+    ]
+
+    def __init__(self, parent, **kw):
+        super().__init__(
+            parent,
+            font=("Menlo", 12), wrap="word",
+            state="disabled", relief="flat", bd=0,
+            bg="#f8f8fc", fg="#1a1a2e",
+            padx=12, pady=12,
+            selectbackground="#d0d8ff",
+            insertbackground="#1a1a2e",
+            highlightthickness=0,
+            **kw,
+        )
+        self.tag_configure("fence",   background="#eeeef8", foreground="#334")
+        self.tag_configure("heading", foreground="#1a1a8a",
+                           font=("Menlo", 12, "bold"))
+        self.tag_configure("bold",    font=("Menlo", 12, "bold"))
+        self.tag_configure("italic",  font=("Menlo", 12, "italic"))
+        self.tag_configure("code",    background="#eeeef8", foreground="#5a4ad1")
+        self.tag_configure("link",    foreground="#1f538d", underline=True)
+        self.tag_configure("comment", foreground="#aaaaaa")
+        self.tag_configure("hr",      foreground="#cccccc")
+
+    def set_text(self, text: str) -> None:
+        self.configure(state="normal")
+        self.delete("1.0", "end")
+        if text:
+            self.insert("1.0", text)
+            self._highlight()
+        self.configure(state="disabled")
+        self.yview_moveto(0)
+
+    def _highlight(self) -> None:
+        content = self.get("1.0", "end-1c")
+        for tag, pattern in self._PATTERNS:
+            self.tag_remove(tag, "1.0", "end")
+            for m in pattern.finditer(content):
+                self.tag_add(tag,
+                             f"1.0 + {m.start()} chars",
+                             f"1.0 + {m.end()} chars")
+
+
 # ── split output (markdown source left + preview right) ──────────────────────
 
 class SplitOutput(ctk.CTkFrame):
@@ -442,10 +610,17 @@ class SplitOutput(ctk.CTkFrame):
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        self.textbox = ctk.CTkTextbox(
-            self, font=("Menlo", 12), wrap="word", state="disabled",
-        )
-        self.textbox.grid(row=0, column=0, sticky="nsew", padx=(0, 3))
+        src_frame = tk.Frame(self, bg="#f8f8fc", highlightthickness=0)
+        src_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 3))
+        src_frame.grid_columnconfigure(0, weight=1)
+        src_frame.grid_rowconfigure(0, weight=1)
+
+        self.textbox = MarkdownSource(src_frame)
+        self.textbox.grid(row=0, column=0, sticky="nsew")
+
+        src_sb = tk.Scrollbar(src_frame, command=self.textbox.yview)
+        src_sb.grid(row=0, column=1, sticky="ns")
+        self.textbox.configure(yscrollcommand=src_sb.set)
 
         # Wrap preview in a plain frame so we can attach a native scrollbar
         pf = tk.Frame(self, bg="#ffffff", highlightthickness=0)
@@ -461,11 +636,7 @@ class SplitOutput(ctk.CTkFrame):
         self._preview.configure(yscrollcommand=sb.set)
 
     def set(self, text: str) -> None:
-        self.textbox.configure(state="normal")
-        self.textbox.delete("1.0", "end")
-        if text:
-            self.textbox.insert("end", text)
-        self.textbox.configure(state="disabled")
+        self.textbox.set_text(text or "")
         self._preview.render(text or "")
 
     def get(self, *args, **kwargs):
@@ -830,6 +1001,7 @@ class SitemapTab(ctk.CTkFrame):
         self.grid_rowconfigure(4, weight=2)  # tree
         self.grid_rowconfigure(7, weight=3)  # output
         self._build()
+        self.after(100, self._load_from_cache_if_empty)
 
     def _build(self):
         # URL row
@@ -941,11 +1113,11 @@ class SitemapTab(ctk.CTkFrame):
 
         style = ttk.Style()
         style.configure("Sitemap.Treeview",
-                        background="#2b2b2b", foreground="#dce4ee",
-                        fieldbackground="#2b2b2b", borderwidth=0,
+                        background="#f5f7fa", foreground="#1a1a2e",
+                        fieldbackground="#f5f7fa", borderwidth=0,
                         rowheight=24, font=("Menlo", 11))
         style.configure("Sitemap.Treeview.Heading",
-                        background="#1f1f1f", foreground="#888", relief="flat")
+                        background="#e8ecf0", foreground="#555", relief="flat")
         style.map("Sitemap.Treeview",
                   background=[("selected", "#1f538d")],
                   foreground=[("selected", "#fff")])
@@ -1086,6 +1258,17 @@ class SitemapTab(ctk.CTkFrame):
 
     # ── fetch & tree ──────────────────────────────────────────────────────────
 
+    def _load_from_cache_if_empty(self):
+        if self._all_urls:
+            return
+        urls = _cache.urls()
+        if urls:
+            self._all_urls = urls
+            self._rebuild_tree(urls)
+            self.status.configure(
+                text=f"{len(urls)} pages from cache · 0 selected", text_color=MUTED)
+            self.convert_btn.configure(state="normal")
+
     def _fetch(self):
         url = self.url_var.get().strip()
         if not url:
@@ -1132,8 +1315,8 @@ class SitemapTab(ctk.CTkFrame):
     def _apply_filter(self, *_):
         if not self._all_urls:
             return
-        url_expr     = self.filter_var.get().strip()
-        content_expr = self.content_filter_var.get().strip()
+        url_expr     = _normalize_filter(self.filter_var.get().strip())
+        content_expr = _normalize_filter(self.content_filter_var.get().strip())
 
         url_fn  = _compile_filter(url_expr) if url_expr else None
         url_vis = [u for u in self._all_urls if url_fn(u.lower())] if url_fn else list(self._all_urls)
@@ -1179,9 +1362,9 @@ class SitemapTab(ctk.CTkFrame):
         self._item_urls.clear()
         self._checked.clear()
 
-        self.tree.tag_configure("normal", foreground="#dce4ee")
-        self.tree.tag_configure("dim",    foreground="#555555")
-        self.tree.tag_configure("folder", foreground="#7a8a9a")
+        self.tree.tag_configure("normal", foreground="#1a1a2e")
+        self.tree.tag_configure("dim",    foreground="#aaaaaa")
+        self.tree.tag_configure("folder", foreground="#5566aa")
 
         if uncached:
             self.select_cached_btn.grid()

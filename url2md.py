@@ -75,10 +75,14 @@ class PageCache:
                         "INSERT OR IGNORE INTO pages (url, md, cached_at, lastmod) VALUES (?,?,?,?)",
                         (url, md, cached_at, lastmod),
                     )
-                    self._conn.execute(
-                        "INSERT INTO pages_fts (url, h1, h2, h3, body) VALUES (?,?,?,?,?)",
-                        (url, h1, h2, h3, body),
-                    )
+                    # Only insert into FTS if the page row was actually inserted
+                    if self._conn.execute(
+                        "SELECT 1 FROM pages_fts WHERE url = ?", (url,)
+                    ).fetchone() is None:
+                        self._conn.execute(
+                            "INSERT INTO pages_fts (url, h1, h2, h3, body) VALUES (?,?,?,?,?)",
+                            (url, h1, h2, h3, body),
+                        )
                 self._conn.execute("COMMIT")
                 self._JSON_PATH.rename(self._JSON_PATH.with_suffix(".json.migrated"))
             except Exception:
@@ -86,8 +90,17 @@ class PageCache:
 
     # ── internal helpers ──────────────────────────────────────────────────────
 
-    @staticmethod
-    def _extract_sections(md: str) -> tuple[str, str, str, str]:
+    _RE_MD_LINK  = re.compile(r'\[([^\]]*)\]\([^)]*\)')   # [text](url) → text
+    _RE_BARE_URL = re.compile(r'https?://\S+')             # bare URLs
+
+    @classmethod
+    def _strip_links(cls, text: str) -> str:
+        text = cls._RE_MD_LINK.sub(r'\1', text)
+        text = cls._RE_BARE_URL.sub('', text)
+        return text
+
+    @classmethod
+    def _extract_sections(cls, md: str) -> tuple[str, str, str, str]:
         """Split Markdown into (h1, h2, h3, body) text for FTS indexing."""
         h1, h2, h3, body = [], [], [], []
         for line in md.splitlines():
@@ -95,13 +108,13 @@ class PageCache:
             if not s or s.startswith("<!--"):
                 continue
             if s.startswith("#### ") or s.startswith("### "):
-                h3.append(s.lstrip("#").strip())
+                h3.append(cls._strip_links(s.lstrip("#").strip()))
             elif s.startswith("## "):
-                h2.append(s[3:].strip())
+                h2.append(cls._strip_links(s[3:].strip()))
             elif s.startswith("# "):
-                h1.append(s[2:].strip())
+                h1.append(cls._strip_links(s[2:].strip()))
             else:
-                body.append(s)
+                body.append(cls._strip_links(s))
         return " ".join(h1), " ".join(h2), " ".join(h3), " ".join(body)
 
     @staticmethod
@@ -120,7 +133,7 @@ class PageCache:
                 skip_next = False
             else:
                 safe = tok.replace('"', '""')
-                terms.append(f'"{safe}"')
+                terms.append(f'"{safe}"*')
         return " OR ".join(terms) if terms else None
 
     # ── public API ────────────────────────────────────────────────────────────
@@ -175,6 +188,25 @@ class PageCache:
                 self._conn.execute("ROLLBACK")
                 raise
 
+    def rebuild_fts(self) -> int:
+        """Drop and rebuild the FTS index from pages. Returns number of rows reindexed."""
+        with self._lock:
+            rows = self._conn.execute("SELECT url, md FROM pages").fetchall()
+            self._conn.execute("BEGIN")
+            try:
+                self._conn.execute("DELETE FROM pages_fts")
+                for row in rows:
+                    h1, h2, h3, body = self._extract_sections(row["md"])
+                    self._conn.execute(
+                        "INSERT INTO pages_fts (url, h1, h2, h3, body) VALUES (?,?,?,?,?)",
+                        (row["url"], h1, h2, h3, body),
+                    )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+        return len(rows)
+
     def clear(self) -> None:
         with self._lock:
             self._conn.execute("BEGIN")
@@ -190,6 +222,14 @@ class PageCache:
         with self._lock:
             row = self._conn.execute("SELECT COUNT(*) FROM pages").fetchone()
         return row[0] if row else 0
+
+    def urls(self) -> list[str]:
+        """Return all cached URLs, ordered alphabetically."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT url FROM pages ORDER BY url"
+            ).fetchall()
+        return [r["url"] for r in rows]
 
     def size_bytes(self) -> int:
         try:
@@ -295,7 +335,7 @@ def fetch_markdown(
     cache: "PageCache | None" = None,
     lastmod: str | None = None,
 ) -> str:
-    if cache is not None:
+    if cache is not None and not keep_images:
         cached = cache.get(url, lastmod)
         if cached is not None:
             return cached
@@ -356,7 +396,7 @@ def fetch_markdown(
     for token, code in pre_blocks.items():
         md = md.replace(token, f"```\n{code}\n```")
 
-    if cache is not None:
+    if cache is not None and not keep_images:
         cache.put(url, md, lastmod=lastmod)
     return md
 
