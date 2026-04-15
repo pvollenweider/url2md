@@ -30,18 +30,27 @@ Grab the latest **macOS DMG** from the [Releases](../../releases/latest) page, o
 
 ```bash
 brew install python@3.13 python-tk@3.13
+```
+
+### Setup
+
+```bash
+python3.13 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
 ### Launch
 
 ```bash
+source .venv/bin/activate   # if not already active
 python3 app.py
 ```
 
 ### CLI usage
 
 ```bash
+source .venv/bin/activate
 ./url2md https://example.com
 # or
 python3 url2md.py https://example.com
