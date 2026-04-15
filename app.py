@@ -8,7 +8,7 @@ from urllib.parse import urldefrag, urlparse
 import tkinter as tk
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 
-from url2md import fetch_markdown
+from url2md import fetch_markdown, fetch_sitemap_urls, is_sitemap_url
 from pdf_export import md_to_pdf
 
 
@@ -201,10 +201,14 @@ class SingleTab(tk.Frame):
         set_output(self.output, "Conversion en cours…", muted=True)
         self.btn.configure(state="disabled", text="…")
         self.copy_btn.configure(state="disabled")
+        self.pdf_btn.configure(state="disabled")
         self.status.configure(text="Chargement…", fg=MUTED)
 
         keep = self.keep_images_var.get()
-        threading.Thread(target=self._fetch, args=(url, keep), daemon=True).start()
+        if is_sitemap_url(url):
+            threading.Thread(target=self._fetch_sitemap, args=(url, keep), daemon=True).start()
+        else:
+            threading.Thread(target=self._fetch, args=(url, keep), daemon=True).start()
 
     def _fetch(self, url, keep_images):
         try:
@@ -213,6 +217,42 @@ class SingleTab(tk.Frame):
         except Exception as exc:
             self.after(0, self._error, str(exc))
 
+    def _fetch_sitemap(self, url, keep_images):
+        try:
+            urls = fetch_sitemap_urls(url)
+        except Exception as exc:
+            self.after(0, self._error, f"Sitemap : {exc}")
+            return
+        if not urls:
+            self.after(0, self._error, "Aucune URL trouvée dans le sitemap")
+            return
+
+        total = len(urls)
+        self.after(0, lambda: self.status.configure(text=f"0 / {total} pages…", fg=MUTED))
+
+        results = {}
+        lock = threading.Lock()
+        done_count = [0]
+
+        def fetch_one(u):
+            try:
+                return u, fetch_markdown(u, keep_images=keep_images), None
+            except Exception as exc:
+                return u, None, str(exc)
+
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            futures = {pool.submit(fetch_one, u): u for u in urls}
+            for future in as_completed(futures):
+                u, md, err = future.result()
+                with lock:
+                    results[u] = (md, err)
+                    done_count[0] += 1
+                    done = done_count[0]
+                self.after(0, lambda d=done: self.status.configure(
+                    text=f"{d} / {total} pages…", fg=MUTED))
+
+        self.after(0, self._done_sitemap, urls, results)
+
     def _done(self, md):
         set_output(self.output, md)
         lines, words = md.count("\n") + 1, len(md.split())
@@ -220,6 +260,30 @@ class SingleTab(tk.Frame):
             text=f"{lines} lignes · {words} mots · {len(md):,} caractères",
             fg=SUCCESS,
         )
+        self.btn.configure(state="normal", text="Convertir")
+        self.copy_btn.configure(state="normal")
+        self.pdf_btn.configure(state="normal")
+
+    def _done_sitemap(self, urls, results):
+        parts = []
+        errors = []
+        for url in urls:
+            md, err = results[url]
+            if err:
+                errors.append(url)
+                parts.append(f"<!-- {url} -->\n\n> **Erreur** : {err}")
+            else:
+                parts.append(f"<!-- {url} -->\n\n{md}")
+
+        separator = "\n\n---\n\n<div style=\"page-break-after: always;\"></div>\n\n"
+        combined = separator.join(parts)
+        set_output(self.output, combined)
+
+        ok = len(urls) - len(errors)
+        msg = f"{ok} / {len(urls)} pages converties"
+        if errors:
+            msg += f" · {len(errors)} erreur(s)"
+        self.status.configure(text=msg, fg=SUCCESS if not errors else ERROR)
         self.btn.configure(state="normal", text="Convertir")
         self.copy_btn.configure(state="normal")
         self.pdf_btn.configure(state="normal")
@@ -357,25 +421,42 @@ class BatchTab(tk.Frame):
         return urls
 
     def _start(self):
-        urls = self._get_urls()
-        if not urls:
+        raw_urls = self._get_urls()
+        if not raw_urls:
             return
 
         set_output(self.output, "", muted=True)
         self.btn.configure(state="disabled", text="…")
         self.copy_btn.configure(state="disabled")
-        self.status.configure(text=f"0 / {len(urls)} pages…", fg=MUTED)
-        self._results = {}
-        self._total = len(urls)
-        self._done_count = 0
+        self.status.configure(text="Préparation…", fg=MUTED)
 
         keep   = self.keep_images_var.get()
         intern = self.internal_links_var.get()
-        threading.Thread(target=self._fetch_all, args=(urls, keep, intern), daemon=True).start()
+        threading.Thread(target=self._expand_and_fetch_all, args=(raw_urls, keep, intern), daemon=True).start()
 
-    def _fetch_all(self, urls, keep_images, internal_links):
+    def _expand_and_fetch_all(self, raw_urls, keep_images, internal_links):
+        # Expand sitemap URLs inline
+        urls = []
+        for u in raw_urls:
+            if is_sitemap_url(u):
+                try:
+                    urls.extend(fetch_sitemap_urls(u))
+                except Exception:
+                    urls.append(u)  # fallback: treat as regular URL
+            else:
+                urls.append(u)
+
+        if not urls:
+            self.after(0, lambda: self.status.configure(text="Aucune URL", fg=ERROR))
+            self.after(0, lambda: self.btn.configure(state="normal", text="Convertir tout"))
+            return
+
+        total = len(urls)
+        self.after(0, lambda: self.status.configure(text=f"0 / {total} pages…", fg=MUTED))
+
         results = {}
         lock = threading.Lock()
+        done_count = [0]
 
         def fetch_one(url):
             try:
@@ -390,18 +471,16 @@ class BatchTab(tk.Frame):
                 url, md, err = future.result()
                 with lock:
                     results[url] = (md, err)
-                    self._done_count += 1
-                    done = self._done_count
-                self.after(0, self._update_progress, done, len(urls))
+                    done_count[0] += 1
+                    done = done_count[0]
+                self.after(0, self._update_progress, done, total)
 
-        # preserve original order
         self.after(0, self._assemble, urls, results, internal_links)
 
     def _update_progress(self, done, total):
         self.status.configure(text=f"{done} / {total} pages…", fg=MUTED)
 
     def _assemble(self, urls, results, internal_links):
-        # Build anchor map before rewriting so every page knows about every other
         url_to_anchor = {url: _url_to_anchor(url) for url in urls}
 
         parts = []
@@ -410,15 +489,15 @@ class BatchTab(tk.Frame):
             md, err = results[url]
             if err:
                 errors.append(url)
-                parts.append(f"> **Erreur** : {url}\n> {err}")
+                parts.append(f"<!-- {url} -->\n\n> **Erreur** : {err}")
             else:
                 if internal_links:
                     md = _rewrite_links(md, url_to_anchor)
                 anchor = url_to_anchor[url]
-                parts.append(f'<a id="{anchor}"></a>\n\n<!-- source: {url} -->\n\n{md}')
+                parts.append(f'<a id="{anchor}"></a>\n\n<!-- {url} -->\n\n{md}')
 
-        page_break = '\n\n<div style="page-break-after: always;"></div>\n\n'
-        combined = page_break.join(parts)
+        separator = '\n\n---\n\n<div style="page-break-after: always;"></div>\n\n'
+        combined = separator.join(parts)
         set_output(self.output, combined)
 
         ok = len(urls) - len(errors)
