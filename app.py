@@ -24,7 +24,9 @@ from url2md import (
     fetch_markdown,
     fetch_sitemap_entries,
     fetch_sitemap_urls,
+    fetch_wildcard_urls,
     is_sitemap_url,
+    is_wildcard_url,
 )
 from pdf_export import md_to_pdf
 from jahia_import import import_xml_to_cache
@@ -997,6 +999,7 @@ class SitemapTab(ctk.CTkFrame):
         self._lastmod: dict[str, str | None] = {}
         self._current_uncached: set[str] = set()
         self.content_filter_var = tk.StringVar()
+        self._stop_event = threading.Event()
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(4, weight=2)  # tree
         self.grid_rowconfigure(7, weight=3)  # output
@@ -1012,7 +1015,7 @@ class SitemapTab(ctk.CTkFrame):
         self.url_var = tk.StringVar()
         ctk.CTkEntry(
             row, textvariable=self.url_var,
-            placeholder_text="https://site.com/sitemap.xml",
+            placeholder_text="https://site.com/sitemap.xml  or  https://site.com/docs/*",
             height=38, font=ctk.CTkFont(size=13),
         ).grid(row=0, column=0, sticky="ew", padx=(0, 8))
         self.url_var.trace_add("write", lambda *_: None)
@@ -1278,8 +1281,26 @@ class SitemapTab(ctk.CTkFrame):
             self.url_var.set(url)
         self.fetch_btn.configure(state="disabled", text="…")
         self.convert_btn.configure(state="disabled")
-        self.status.configure(text="Loading sitemap…", text_color=MUTED)
-        threading.Thread(target=self._do_fetch, args=(url,), daemon=True).start()
+        if is_wildcard_url(url):
+            self.status.configure(text="Crawling…", text_color=MUTED)
+            threading.Thread(target=self._do_fetch_wildcard, args=(url,), daemon=True).start()
+        else:
+            self.status.configure(text="Loading sitemap…", text_color=MUTED)
+            threading.Thread(target=self._do_fetch, args=(url,), daemon=True).start()
+
+    def _do_fetch_wildcard(self, pattern):
+        try:
+            def _progress(n):
+                self.after(0, lambda n=n: self.status.configure(
+                    text=f"Crawling… {n} pages found", text_color=MUTED))
+            urls = fetch_wildcard_urls(pattern, progress_cb=_progress)
+            entries = [{"url": u, "lastmod": None} for u in urls]
+            self.after(0, self._populate_entries, entries)
+        except Exception as exc:
+            self.after(0, lambda: self.status.configure(
+                text=f"Error: {exc}", text_color=ERROR))
+            self.after(0, lambda: self.fetch_btn.configure(
+                state="normal", text="Fetch sitemap"))
 
     def _do_fetch(self, url):
         try:
@@ -1507,8 +1528,10 @@ class SitemapTab(ctk.CTkFrame):
         if not urls:
             self.status.configure(text="No page selected", text_color=ERROR)
             return
+        self._stop_event.clear()
         set_output(self.output, "")
-        self.convert_btn.configure(state="disabled", text="…")
+        self.convert_btn.configure(text="Stop", fg_color="#e05555", hover_color="#c03333",
+                                   command=self._stop_convert)
         self.copy_btn.configure(state="disabled")
         self.pdf_btn.configure(state="disabled")
         self.status.configure(text=f"0 / {len(urls)} pages…", text_color=MUTED)
@@ -1516,12 +1539,18 @@ class SitemapTab(ctk.CTkFrame):
             target=self._do_convert, args=(urls, self.keep_images_var.get()), daemon=True,
         ).start()
 
+    def _stop_convert(self):
+        self._stop_event.set()
+        self.convert_btn.configure(state="disabled", text="Stopping…")
+
     def _do_convert(self, urls, keep_images):
         results = {}
         lock = threading.Lock()
         total = len(urls)
         done_count = [0]
         def fetch_one(url):
+            if self._stop_event.is_set():
+                return url, None, "cancelled"
             lm = self._lastmod.get(url)
             try:
                 return url, fetch_markdown(
@@ -1539,12 +1568,21 @@ class SitemapTab(ctk.CTkFrame):
                     done = done_count[0]
                 self.after(0, lambda d=done, t=total: self.status.configure(
                     text=f"{d} / {t} pages…", text_color=MUTED))
+                if self._stop_event.is_set():
+                    for f in futures:
+                        f.cancel()
+                    break
         self.after(0, self._assemble, urls, results)
 
     def _assemble(self, urls, results):
+        stopped = self._stop_event.is_set()
         parts, errors = [], []
         for url in urls:
+            if url not in results:
+                continue
             md, err = results[url]
+            if err == "cancelled":
+                continue
             if err:
                 errors.append(url)
                 parts.append(f"<!-- {url} -->\n\n> **Error**: {err}")
@@ -1552,12 +1590,18 @@ class SitemapTab(ctk.CTkFrame):
                 parts.append(f"<!-- {url} -->\n\n{md}")
         sep = '\n\n---\n\n<div style="page-break-after:always"></div>\n\n'
         set_output(self.output, sep.join(parts))
-        ok = len(urls) - len(errors)
-        msg = f"{ok} / {len(urls)} pages converted"
+        ok = len(parts) - len(errors)
+        if stopped:
+            msg = f"Stopped — {ok} / {len(urls)} pages converted"
+        else:
+            msg = f"{ok} / {len(urls)} pages converted"
         if errors:
             msg += f" · {len(errors)} error(s)"
-        self.status.configure(text=msg, text_color=SUCCESS if not errors else ERROR)
-        self.convert_btn.configure(state="normal", text="Convert selection")
+        self.status.configure(text=msg, text_color=MUTED if stopped else (SUCCESS if not errors else ERROR))
+        self.convert_btn.configure(state="normal", text="Convert selection",
+                                   fg_color=ctk.ThemeManager.theme["CTkButton"]["fg_color"],
+                                   hover_color=ctk.ThemeManager.theme["CTkButton"]["hover_color"],
+                                   command=self._convert)
         self.copy_btn.configure(state="normal")
         self.pdf_btn.configure(state="normal")
         self._update_cache_label()

@@ -14,6 +14,8 @@ Convert any web page to clean Markdown — with a native macOS GUI.
 - **Single URL** — paste a URL, get Markdown in one click
 - **Batch mode** — convert a list of URLs (or sitemap.xml links) and merge them into a single document
 - **Sitemap browser** — fetch a sitemap.xml, browse pages in a hierarchical tree with checkboxes, filter by boolean expression
+- **Wildcard crawl** — no sitemap? Use `https://site.com/docs/*` to crawl recursively from a URL prefix (BFS link-walk, capped at 500 pages)
+- **Interruptible conversion** — the Convert button turns into Stop while batch jobs run; partial output is preserved
 - **Smart content extraction** — picks `<article>` when unique, falls back to `<main>` then other heuristics; strips navbars, sidebars, footers and Bootstrap nav components automatically
 - **Fenced code blocks** — `<pre>` and `<pre><code>` blocks become proper ` ``` ` fenced blocks
 - **Internal link rewriting** — in batch mode, cross-page links become in-document anchors
@@ -80,6 +82,16 @@ python3 jahia_import.py export.xml https://academy.jahia.com
 4. If exactly one <article> exists  →  use it
 5. Else: <main>  →  #content  →  #main  →  .content  →  .main  →  <body>
 ```
+
+## Discovering pages
+
+The Sitemap tab accepts three URL forms in its input field:
+
+| Input | Behaviour |
+|---|---|
+| `https://site.com/sitemap.xml` | Loads the sitemap (or sitemap index) directly |
+| `https://site.com/docs/*` | **Wildcard crawl** — first probes `/sitemap.xml`, `/sitemap-index.xml`, `/sitemap-0.xml` and filters entries by prefix. If none returns matches, falls back to a BFS link-walk starting from the prefix (capped at 500 pages). Use this for sites without a sitemap, or to extract a single subtree of a large sitemap. |
+| `https://site.com/page` | Treated as a single page (Single URL tab is preferable) |
 
 ## Filter syntax
 

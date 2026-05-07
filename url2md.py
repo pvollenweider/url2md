@@ -283,6 +283,73 @@ def is_sitemap_url(url: str) -> bool:
     return path.endswith(".xml") and "sitemap" in path
 
 
+def is_wildcard_url(url: str) -> bool:
+    """True if the URL ends with * (crawl pattern)."""
+    return url.rstrip().endswith("*")
+
+
+def fetch_wildcard_urls(pattern: str, max_pages: int = 500,
+                        progress_cb=None) -> list[str]:
+    """
+    Return all URLs matching a wildcard prefix pattern.
+
+    Strategy:
+    1. Try the site's sitemap (sitemap.xml / sitemap-index.xml / sitemap-0.xml)
+       and filter entries by prefix — fast and complete for JS-rendered sites.
+    2. Fall back to BFS link-crawl for sites without a sitemap.
+
+    progress_cb(discovered: int) is called after each page crawled (BFS only).
+    """
+    from urllib.parse import urlparse
+    prefix = pattern.rstrip("*").rstrip("/")
+    base   = prefix + "/"
+    parsed = urlparse(prefix)
+    root   = f"{parsed.scheme}://{parsed.netloc}"
+
+    # ── 1. sitemap probe ──────────────────────────────────────────────────────
+    for sitemap_path in ("/sitemap.xml", "/sitemap-index.xml", "/sitemap-0.xml"):
+        sitemap_url = root + sitemap_path
+        try:
+            entries = fetch_sitemap_entries(sitemap_url)
+            matched = sorted(e["url"] for e in entries if e["url"].startswith(prefix))
+            if matched:
+                return matched
+        except Exception:
+            continue
+
+    # ── 2. BFS link-crawl ─────────────────────────────────────────────────────
+    visited: set[str] = set()
+    queue:   list[str] = [base]
+
+    def _normalise(href: str, current: str) -> str | None:
+        url = urljoin(current, href).split("#")[0].split("?")[0]
+        if not url.startswith(prefix):
+            return None
+        return url if url.endswith("/") else url + "/"
+
+    while queue and len(visited) < max_pages:
+        url = queue.pop(0)
+        if url in visited:
+            continue
+        try:
+            resp = requests.get(url, headers=_HEADERS, timeout=15,
+                                verify=certifi.where())
+            resp.raise_for_status()
+        except Exception:
+            visited.add(url)
+            continue
+        visited.add(url)
+        if progress_cb:
+            progress_cb(len(visited))
+        soup = BeautifulSoup(resp.content, "html.parser")
+        for a in soup.find_all("a", href=True):
+            norm = _normalise(a["href"], resp.url)
+            if norm and norm not in visited and norm not in queue:
+                queue.append(norm)
+
+    return sorted(visited)
+
+
 def fetch_sitemap_entries(url: str) -> list[dict]:
     """
     Fetch a sitemap (or sitemap index) and return a list of
@@ -335,6 +402,8 @@ def fetch_markdown(
     cache: "PageCache | None" = None,
     lastmod: str | None = None,
 ) -> str:
+    if url.startswith("view-source:"):
+        url = url[len("view-source:"):]
     if cache is not None and not keep_images:
         cached = cache.get(url, lastmod)
         if cached is not None:
@@ -356,23 +425,27 @@ def fetch_markdown(
     # Remove noise
     for tag in soup(["script", "style", "nav", "header", "footer", "aside", "noscript"]):
         tag.decompose()
-    for tag in soup.find_all(class_=lambda c: c and "nav" in c.split()):
+    for tag in soup.find_all(class_=lambda c: c and any(
+        cls == "nav" or cls.startswith("footer") or cls.startswith("header")
+        for cls in c
+    )):
         tag.decompose()
 
-    # Try to find main content
+    # Try to find main content; skip candidates with too little text
+    def _pick(el):
+        return el if el and len(el.get_text(strip=True)) > 200 else None
+
     articles = soup.find_all("article")
     content = (
-        (articles[0] if len(articles) == 1 else None)
-        or soup.find("main")
-        or soup.find(id="content")
-        or soup.find(id="main")
-        or soup.find(class_="content")
-        or soup.find(class_="main")
+        _pick(articles[0] if len(articles) == 1 else None)
+        or _pick(soup.find("main"))
+        or _pick(soup.find(id="content"))
+        or _pick(soup.find(id="main"))
+        or _pick(soup.find(class_="content"))
+        or _pick(soup.find(class_="main"))
         or soup.find("body")
+        or soup
     )
-
-    if content is None:
-        content = soup
 
     # Pull <pre> blocks out before html2text so they become fenced code blocks
     # instead of 4-space-indented text.  Works for <pre><code>…</code></pre>
